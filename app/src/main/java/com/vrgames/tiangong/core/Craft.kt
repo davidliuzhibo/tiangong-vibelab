@@ -12,18 +12,23 @@ enum class Craft(val title: String, val book: String) { PAPER("造纸", "杀青"
 enum class Fold(val label: String) { HALF("对折"), QUARTER("四折"), FAN("扇形折"), TRIANGLE("三角折") }
 
 /**
- * One step of an order. Each kind is a small game; each gives a score 0..1 when done (TAP steps
- * give none). [say] tells the player what to do and, read carefully, what the order wants.
+ * One step of an order. Each kind is a small game done by hand on the workshop's tools (v0.2: no
+ * step is timed any more); each gives a score 0..1 when done (TAP steps give none). [say] tells the
+ * player what to do and, read carefully, what the order wants.
  */
 sealed class Step(val title: String, val say: String) {
     /** Pick the right one of [options] ([answer]). */
     class Choice(title: String, say: String, val options: List<String>, val answer: Int) : Step(title, say)
 
-    /** A needle sweeps from 0 to 1 over [seconds]; stop it at [target] (within [tolerance] is perfect). */
-    class Gauge(title: String, say: String, val target: Double, val tolerance: Double, val seconds: Double = 6.0, val low: String = "", val high: String = "") : Step(title, say)
+    /**
+     * Set an amount 0..1 by moving [tool] by hand (the fire's damper, the bellows, the wick, how deep
+     * the mould goes into the pulp), then settle it; [target] within [tolerance] is perfect. Nothing
+     * moves by itself: the player takes all the time they like.
+     */
+    class Gauge(title: String, say: String, val target: Double, val tolerance: Double, val tool: String, val low: String = "", val high: String = "") : Step(title, say)
 
-    /** Strike [count] times on the beat (a marker bounces every [period] seconds; hit within [window] of the top). */
-    class Rhythm(title: String, say: String, val count: Int, val period: Double = 0.9, val window: Double = 0.16) : Step(title, say)
+    /** Pound [count] times with [tool] (the pestle, the hammer): counted, not timed. */
+    class Rhythm(title: String, say: String, val count: Int, val tool: String) : Step(title, say)
 
     /** Throw the pot: set the radius of each of four rings (levels 1..6, bottom to mouth) to match [target]. */
     class Shape(title: String, say: String, val target: IntArray, val height: Double) : Step(title, say)
@@ -31,8 +36,26 @@ sealed class Step(val title: String, val say: String) {
     /** Fold the cloth, tie bands at some of five places, dip it a number of times: match [target]. */
     class Tie(title: String, say: String, val target: Dye) : Step(title, say)
 
-    /** Just do it (cut, press, dry): an animation, no score. */
-    class Tap(title: String, say: String, val action: String) : Step(title, say)
+    /**
+     * Done by hand, no score: [action] says how. [Tap.strokes] strokes of a tool (chop, press),
+     * rubbing a tool to and fro (trim, paint, write: [RUB_M] of motion), or carrying a thing to its
+     * place (dry, wrap, give).
+     */
+    class Tap(title: String, say: String, val action: String) : Step(title, say) {
+        val gesture get() = when (action) {
+            "chop", "press" -> Gesture.STROKES
+            "trim", "paint", "write" -> Gesture.RUB
+            else -> Gesture.CARRY
+        }
+        val strokes get() = if (action == "chop") 3 else 2
+    }
+
+    enum class Gesture { STROKES, RUB, CARRY }
+
+    companion object {
+        /** Meters of to-and-fro motion that finish a rubbed step (trim, paint, write). */
+        const val RUB_M = 0.3
+    }
 }
 
 /** A tie-dye recipe: the fold, which of the five band places are tied, how many dips (1..5). */
@@ -90,32 +113,20 @@ class Work(val order: Order) {
     val done get() = at >= order.steps.size
     val step get() = order.steps.getOrNull(at)
 
-    // The state of the timed steps.
-    var gaugeT = 0.0; private set
-    var rhythmT = 0.0; private set
+    // The state of the hand-done steps.
+    /** Where the player has set the gauge step's amount, 0..1. */
+    var gauge = 0.0; private set
     var hits = 0; private set
-    var misses = 0; private set
+    /** How far a tap step has got, 0..1 (strokes, rubbing, carrying). */
+    var progress = 0.0; private set
     val rings = IntArray(4) { 3 }
     var fold: Fold? = null
     val bands = HashSet<Int>()
-    var dips = 1
+    var dips = 0
 
-    /** Advances timed steps by [dt]; a gauge that ran out stops at the end. */
-    fun tick(dt: Double) {
-        when (val s = step) {
-            is Step.Gauge -> {
-                gaugeT += dt
-                if (gaugeT >= s.seconds) stopGauge()
-            }
-            is Step.Rhythm -> rhythmT += dt
-            else -> Unit
-        }
+    fun setGauge(v: Double) {
+        if (step is Step.Gauge) gauge = v.coerceIn(0.0, 1.0)
     }
-
-    val gauge get() = (step as? Step.Gauge)?.let { (gaugeT / it.seconds).coerceIn(0.0, 1.0) } ?: 0.0
-
-    /** Height of the rhythm marker 0..1 (1 at the top of its bounce). */
-    val beat get() = (step as? Step.Rhythm)?.let { s -> val ph = (rhythmT % s.period) / s.period; 1 - abs(ph * 2 - 1) } ?: 0.0
 
     fun choose(i: Int): Boolean {
         val s = step as? Step.Choice ?: return false
@@ -124,7 +135,7 @@ class Work(val order: Order) {
         return ok
     }
 
-    /** Stops the needle; returns the score. */
+    /** Settles the amount where it is set; returns the score. */
     fun stopGauge(): Double {
         val s = step as? Step.Gauge ?: return 0.0
         val x = gauge
@@ -134,15 +145,31 @@ class Work(val order: Order) {
         return sc
     }
 
-    /** A strike: on the beat or not. Returns whether it was. */
+    /** A strike of the pestle or hammer: every one counts. Returns whether the count is reached. */
     fun strike(): Boolean {
         val s = step as? Step.Rhythm ?: return false
-        val ph = (rhythmT % s.period) / s.period
-        val fromTop = abs(ph - 0.5) * s.period
-        val ok = fromTop <= s.window
-        if (ok) hits++ else misses++
-        if (hits >= s.count) score((hits.toDouble() / (hits + misses * 0.5)).coerceIn(0.0, 1.0))
-        return ok
+        hits++
+        if (hits >= s.count) {
+            score(1.0)
+            return true
+        }
+        return false
+    }
+
+    /** One more dip of the bundle in the vat (up to five). */
+    fun dip() {
+        if (step is Step.Tie) dips = (dips + 1).coerceAtMost(5)
+    }
+
+    /** A tap step moves on by [amount] (a stroke is 1/strokes, rubbing meters/[Step.RUB_M], a carry 1). Returns whether it is done. */
+    fun advance(amount: Double): Boolean {
+        if (step !is Step.Tap) return false
+        progress += amount
+        if (progress >= 0.999) {
+            next()
+            return true
+        }
+        return false
     }
 
     fun ring(i: Int, by: Int) { rings[i] = (rings[i] + by).coerceIn(1, 6) }
@@ -156,7 +183,7 @@ class Work(val order: Order) {
         return sc
     }
 
-    fun dye(): Dye? = fold?.let { Dye(it, bands.toSet(), dips) }
+    fun dye(): Dye? = fold?.takeIf { dips > 0 }?.let { Dye(it, bands.toSet(), dips) }
 
     /** The cloth is dyed and untied: scores how alike it is to the order's. */
     fun dyed(): Double {
@@ -177,11 +204,15 @@ class Work(val order: Order) {
         hints++
         return when (val s = step) {
             is Step.Choice -> "应该选「${s.options[s.answer]}」。"
-            is Step.Gauge -> "指针走到 ${(s.target * 100).toInt()}% 左右时停。"
-            is Step.Rhythm -> "标记跳到最高处时捶。"
+            is Step.Gauge -> "调到 ${(s.target * 100).toInt()}% 左右再定下来。"
+            is Step.Rhythm -> "捏住${s.tool}往下砸，抬起来再砸，一共 ${s.count} 下。"
             is Step.Shape -> "从下往上依次是 ${s.target.joinToString("、")} 档。"
             is Step.Tie -> "${s.target.fold.label}，在第 ${s.target.bands.sorted().joinToString("、") { (it + 1).toString() }} 道扎绳，染 ${s.target.dips} 次。"
-            is Step.Tap -> "捏一下就好。"
+            is Step.Tap -> when (s.gesture) {
+                Step.Gesture.STROKES -> "捏住工具往下压，抬起再压，${s.strokes} 下。"
+                Step.Gesture.RUB -> "捏住工具来回拖动，直到做完。"
+                Step.Gesture.CARRY -> "捏住它，拖到发亮的地方松开。"
+            }
             null -> ""
         }
     }
@@ -193,10 +224,9 @@ class Work(val order: Order) {
 
     private fun next() {
         at++
-        gaugeT = 0.0
-        rhythmT = 0.0
+        gauge = 0.0
         hits = 0
-        misses = 0
+        progress = 0.0
     }
 
     /** The finished piece's quality 0..1 (the scored steps' mean, a little less for each hint). */

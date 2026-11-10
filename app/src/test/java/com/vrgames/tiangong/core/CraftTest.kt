@@ -12,16 +12,13 @@ class CraftTest {
         var guard = 0
         while (!w.done && guard++ < 100000) {
             when (val s = w.step!!) {
-                is Step.Tap -> w.tap()
+                is Step.Tap -> w.advance(1.0)
                 is Step.Choice -> w.choose(if (sloppy) (s.answer + 1) % s.options.size else s.answer)
                 is Step.Gauge -> {
-                    val aim = if (sloppy) s.target + 3 * s.tolerance else s.target
-                    if (w.gauge >= aim) w.stopGauge() else w.tick(0.01)
+                    w.setGauge(if (sloppy) s.target + 3 * s.tolerance else s.target)
+                    w.stopGauge()
                 }
-                is Step.Rhythm -> {
-                    if (w.beat > 0.97) w.strike()
-                    w.tick(0.01)
-                }
+                is Step.Rhythm -> w.strike()
                 is Step.Shape -> {
                     for (i in 0 until 4) while (w.rings[i] != s.target[i]) w.ring(i, if (w.rings[i] < s.target[i]) 1 else -1)
                     if (sloppy) w.ring(0, 2)
@@ -30,7 +27,8 @@ class CraftTest {
                 is Step.Tie -> {
                     w.fold = s.target.fold
                     w.bands.clear(); w.bands.addAll(s.target.bands)
-                    w.dips = s.target.dips + if (sloppy) 2 else 0
+                    val n = s.target.dips.let { if (!sloppy) it else if (it > 2) it - 2 else it + 2 }
+                    repeat(n) { w.dip() }
                     w.dyed()
                 }
             }

@@ -102,8 +102,22 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
     private val kilnGlowMat = glow(color(1f, 0.45f, 0.15f, 0f)).shared()
     private var strikeT = 0.0
     private var strikeAt: Craft? = null
-    private var dipT = 0.0
-    private var dyeT = 0.0
+
+    // ---- v0.2: the tools the player's hand moves ----
+
+    /** A tool the hand moves: its rest place in the front station's frame (or the shop's), and where the hand has put it. */
+    private class Grip(val node: Entity, val rest: Vector3, val shopFrame: Boolean) {
+        var off = Vector3(0f, 0f, 0f)
+    }
+
+    private val grips = HashMap<String, Grip>()
+    /** Grips that come and go with their step (the rest are always on the bench). */
+    private val optional = HashSet<String>()
+    private var glinting: Set<String> = emptySet()
+    private var glintT = 0.0
+    private var potRings = IntArray(4) { 3 }
+    private var potH = 0.1f
+    private val dropMark = Entity().also { it.enabled = false }
     private var wheelSpin = false
     private var showing: Craft? = null
     private var showT = 0.0
@@ -142,10 +156,6 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
             }
             bench.addChild(s)
             stations[c] = s
-            // The station's work: the whole of it can be pinched for the timed steps.
-            val w = Entity().apply { setPos(Vector3(0f, 0.07f, 0f)) }
-            hit(w, "work", Vector3(0.2f, 0.14f, 0.14f))
-            s.addChild(w)
         }
 
         // Paper: vat with pulp, mortar and pestle, the mould, bamboo, the drying board.
@@ -156,13 +166,25 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
         ps.addChild(model(MeshResource.createBox(if (aiVat) Vector3(0.038f, 0.002f, 0.068f) else Vector3(0.046f, 0.002f, 0.07f), 0.001f), pulpMat).apply { setPos(Vector3(-0.065f, if (aiVat) 0.016f else 0.034f, -0.01f)) })
         mortar = place(ps, "mortar", 0.055f, Vector3(0.065f, 0f, -0.025f)) { model(MeshResource.createCylinder(0.035f, 0.022f), stone).apply { setPos(Vector3(0f, 0.0175f, 0f)) } }
         place(ps, "bamboo", 0.09f, Vector3(0.0f, 0f, 0.055f), yaw = 90f, tool = "bamboo") { bambooFallback() }
-        pestle.addChild(model(MeshResource.createCylinder(0.08f, 0.005f), wood).apply { transform().eulerAngles = EulerAngles(0f, 0f, 12f) })
-        pestle.addChild(model(MeshResource.createCylinder(0.02f, 0.009f), wood).apply { setPos(Vector3(0.0085f, -0.038f, 0f)) })
-        // The AI mortar has its own pestle: then the strike moves the whole mortar instead.
-        pestle.enabled = models["mortar"] == null
-        ps.addChild(pestle)
+        // The pestle the hand lifts and brings down (the AI mortar's own pestle stays leaning in it).
+        pestle.addChild(model(MeshResource.createCylinder(0.08f, 0.005f), wood))
+        pestle.addChild(model(MeshResource.createCylinder(0.02f, 0.009f), wood).apply { setPos(Vector3(0f, -0.04f, 0f)) })
+        grip("pestle", ps, pestle, Vector3(0.065f, 0.1f, -0.025f), Vector3(0.03f, 0.1f, 0.03f))
         (models["mould"]?.clone(Entity.CloneOptions(true, true))?.also { it.setScale(0.07f) } ?: model(MeshResource.createBox(Vector3(0.07f, 0.004f, 0.045f), 0.001f), bamboo)).let { mould.addChild(it) }
-        ps.addChild(mould)
+        grip("mould", ps, mould, Vector3(-0.065f, 0.06f, -0.01f), Vector3(0.08f, 0.03f, 0.06f))
+        // The chopper over the bamboo; the firewood before the vat; the press board.
+        grip("knife", ps, tool("chopper", 0.085f, EulerAngles(0f, 0f, 0f), lift = -0.007f) ?: Entity().apply {
+            addChild(model(MeshResource.createBox(Vector3(0.045f, 0.016f, 0.003f), 0.001f), pbr(color(0.62f, 0.63f, 0.66f), metallic = 0.85f, roughness = 0.35f)))
+            addChild(model(MeshResource.createCylinder(0.03f, 0.004f), darkWood).apply { setPos(Vector3(0.035f, 0.004f, 0f)); transform().eulerAngles = EulerAngles(0f, 0f, 90f) })
+        }, Vector3(0f, 0.05f, 0.055f), Vector3(0.08f, 0.04f, 0.03f), optional = true)
+        grip("fire", ps, Entity().apply {
+            for (k in -1..1) addChild(model(MeshResource.createCylinder(0.035f, 0.0035f), darkWood).apply { setPos(Vector3(k * 0.007f, 0f, 0f)); transform().eulerAngles = EulerAngles(70f, 0f, k * 12f) })
+            addChild(model(sphere, glow(color(1f, 0.45f, 0.12f, 0.8f))).apply { setPos(Vector3(0f, 0.004f, -0.012f)); setScale(0.006f) })
+        }, Vector3(-0.065f, 0.008f, 0.045f), Vector3(0.04f, 0.04f, 0.04f))
+        grip("press", ps, Entity().apply {
+            addChild(model(MeshResource.createBox(Vector3(0.07f, 0.006f, 0.05f), 0.002f), darkWood))
+            addChild(model(MeshResource.createCylinder(0.02f, 0.004f), wood).apply { setPos(Vector3(0f, 0.013f, 0f)) })
+        }, Vector3(-0.065f, 0.075f, -0.01f), Vector3(0.08f, 0.04f, 0.06f), optional = true)
         ps.addChild(model(MeshResource.createBox(Vector3(0.085f, 0.1f, 0.006f), 0.002f), darkWood).apply { setPos(Vector3(0.01f, 0.05f, -0.07f)) })
         paperSheet = model(quad(0.07f, 0.085f), paperMat).apply { setPos(Vector3(0.01f, 0.052f, -0.0665f)); enabled = false }
         ps.addChild(paperSheet)
@@ -172,7 +194,8 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
         // Porcelain: the wheel with the pot on it, the kiln.
         val cs = stations.getValue(Craft.PORCELAIN)
         place(cs, "wheel", 0.07f, Vector3(-0.045f, 0f, 0.01f), tool = "wheel") { wheelFallback() }
-        potHolder.setPos(Vector3(-0.045f, 0.048f, 0.01f))
+        // The pot stands on the wheel head (the v0.2 wheel is a plain, taller head with no clay of its own).
+        potHolder.setPos(Vector3(-0.045f, if (models["wheel"] != null) 0.063f else 0.048f, 0.01f))
         potHolder.addChild(pot)
         cs.addChild(potHolder)
         // The AI kiln is a long tunnel kiln (龙窑): 14 cm long, its mouth toward the player.
@@ -183,6 +206,18 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
             place(cs, "kiln", 0.08f, Vector3(0.065f, 0f, -0.03f), tool = "kiln") { kilnFallback() }
             cs.addChild(model(sphere, kilnGlowMat).apply { setPos(Vector3(0.065f, 0.03f, -0.005f)); setScale(0.028f) })
         }
+
+        for (i in 0 until 4) grip("ring$i", cs, model(sphere, glow(color(1f, 0.85f, 0.4f, 1f))).apply { setScale(0.0045f) }, Vector3(0f, 0f, 0f), Vector3(0.022f, 0.022f, 0.022f), optional = true)
+        grip("trimmer", cs, Entity().apply {
+            addChild(model(MeshResource.createCylinder(0.04f, 0.0035f), wood).apply { transform().eulerAngles = EulerAngles(0f, 0f, 70f) })
+            addChild(model(MeshResource.createBox(Vector3(0.012f, 0.004f, 0.008f), 0.001f), pbr(color(0.62f, 0.63f, 0.66f), metallic = 0.85f, roughness = 0.35f)).apply { setPos(Vector3(-0.019f, -0.007f, 0f)) })
+        }, Vector3(-0.005f, 0.075f, 0.04f), Vector3(0.05f, 0.04f, 0.04f), optional = true)
+        grip("brush", cs, brushModel(), Vector3(-0.005f, 0.08f, 0.04f), Vector3(0.03f, 0.06f, 0.03f), optional = true)
+        grip("bellows", cs, Entity().apply {
+            addChild(model(MeshResource.createBox(Vector3(0.006f, 0.05f, 0.006f), 0.001f), wood).apply { setPos(Vector3(0f, 0.025f, 0f)) })
+            addChild(model(MeshResource.createBox(Vector3(0.02f, 0.008f, 0.008f), 0.002f), darkWood).apply { setPos(Vector3(0f, 0.052f, 0f)) })
+        }, Vector3(0.12f, 0.0f, 0.05f), Vector3(0.03f, 0.07f, 0.03f))
+        cs.addChild((tool("bellows", 0.05f, EulerAngles(0f, 90f, 0f)) ?: model(MeshResource.createBox(Vector3(0.03f, 0.018f, 0.034f), 0.004f), pbr(color(0.4f, 0.27f, 0.17f), roughness = 0.8f)).apply { setPos(Vector3(0f, 0.009f, 0f)) }).apply { setPos(Vector3(0.12f, 0f, 0.05f)) })
 
         // Dye: the vat, the cloth on a bamboo rack, the order's pattern on a little board, the bundle.
         val ds = stations.getValue(Craft.DYE)
@@ -200,8 +235,9 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
         ds.addChild(clothRack)
         ds.addChild(model(MeshResource.createBox(Vector3(0.058f, 0.058f, 0.004f), 0.001f), darkWood).apply { setPos(Vector3(-0.005f, 0.03f, 0.065f)); transform().eulerAngles = EulerAngles(-60f, 0f, 0f) })
         ds.addChild(model(quad(0.05f, 0.05f), targetMat).apply { setPos(Vector3(-0.005f, 0.031f, 0.067f)); transform().eulerAngles = EulerAngles(-60f, 0f, 0f) })
-        bundle.setPos(BUNDLE_REST)
-        ds.addChild(bundle)
+        grip("bundle", ds, bundle, BUNDLE_REST, Vector3(0.11f, 0.03f, 0.05f))
+        grip("rope", ds, model(MeshResource.createTorus(0.008f, 0.005f), rope), Vector3(-0.03f, 0.004f, 0.07f), Vector3(0.03f, 0.02f, 0.03f), optional = true)
+        grip("cloth", ds, model(MeshResource.createBox(Vector3(0.05f, 0.008f, 0.04f), 0.003f), clothMat), Vector3(0f, 0.006f, 0.05f), Vector3(0.06f, 0.03f, 0.05f), optional = true)
 
         // Ink: the lamp gathering soot, the mould, the inkstone, the hammer, the stick.
         val ks = stations.getValue(Craft.INK)
@@ -209,12 +245,29 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
         place(ks, "inkmold", 0.06f, Vector3(0.06f, 0f, -0.035f), tool = "inkmold") { model(MeshResource.createBox(Vector3(0.06f, 0.02f, 0.03f), 0.003f), wood).apply { setPos(Vector3(0f, 0.01f, 0f)) } }
         place(ks, "inkstone", 0.07f, Vector3(-0.005f, 0f, 0.055f)) { model(MeshResource.createBox(Vector3(0.06f, 0.012f, 0.04f), 0.004f), stone).apply { setPos(Vector3(0f, 0.006f, 0f)) } }
         ks.addChild(model(MeshResource.createCylinder(0.012f, 0.03f), stone).apply { setPos(Vector3(0.03f, 0.006f, 0.02f)) })
-        hammer.setPos(Vector3(0.03f, 0.08f, 0.02f))
-        hammer.addChild(model(MeshResource.createCylinder(0.07f, 0.0035f), wood).apply { transform().eulerAngles = EulerAngles(0f, 0f, 70f) })
-        hammer.addChild(model(MeshResource.createBox(Vector3(0.016f, 0.03f, 0.016f), 0.003f), darkWood).apply { setPos(Vector3(0.032f, -0.012f, 0f)) })
-        ks.addChild(hammer)
-        inkStick.setPos(Vector3(0.03f, 0.018f, 0.02f))
+        // The ink mallet: the model stands head up, so it is turned over (head down, at the holder).
+        tool("mallet", 0.07f, EulerAngles(0f, 0f, 180f), lift = 0.07f)?.let { hammer.addChild(it) } ?: run {
+            hammer.addChild(model(MeshResource.createCylinder(0.07f, 0.0035f), wood).apply { setPos(Vector3(0f, 0.035f, 0f)) })
+            hammer.addChild(model(MeshResource.createBox(Vector3(0.03f, 0.016f, 0.016f), 0.003f), darkWood))
+        }
+        grip("hammer", ks, hammer, Vector3(0.03f, 0.05f, 0.02f), Vector3(0.04f, 0.08f, 0.03f))
+        grip("wick", ks, Entity().apply {
+            addChild(model(MeshResource.createCylinder(0.03f, 0.0015f), rope).apply { setPos(Vector3(0f, 0.015f, 0f)) })
+            addChild(model(sphere, glow(color(1f, 0.7f, 0.3f, 1f))).apply { setPos(Vector3(0f, 0.032f, 0f)); setScale(0.003f) })
+        }, Vector3(-0.035f, 0.01f, 0.015f), Vector3(0.025f, 0.05f, 0.025f))
+        // The ash box where the sticks dry; the stick the hand carries there.
+        ks.addChild(model(MeshResource.createBox(Vector3(0.05f, 0.014f, 0.035f), 0.003f), darkWood).apply { setPos(Vector3(0.075f, 0.007f, 0.055f)) })
+        ks.addChild(model(MeshResource.createBox(Vector3(0.044f, 0.002f, 0.029f), 0.001f), pbr(color(0.62f, 0.6f, 0.58f), roughness = 1f)).apply { setPos(Vector3(0.075f, 0.0145f, 0.055f)) })
+        inkStick.setPos(Vector3(0.075f, 0.018f, 0.055f))
         ks.addChild(inkStick)
+        grip("stick", ks, Entity(), Vector3(0.03f, 0.008f, 0.02f), Vector3(0.07f, 0.03f, 0.03f), optional = true)
+
+        // The gift's tools (in the shop's frame, by the gift): the brush, the cloth, the wrapped bowl.
+        grip("pen", shop, brushModel(), Vector3(-0.2f, BASE_TOP + 0.1f, 0.12f), Vector3(0.03f, 0.06f, 0.03f), optional = true, shopFrame = true)
+        grip("wrapcloth", shop, model(MeshResource.createBox(Vector3(0.05f, 0.008f, 0.04f), 0.003f), clothMat), Vector3(-0.12f, BASE_TOP + 0.005f, 0.1f), Vector3(0.06f, 0.03f, 0.05f), optional = true, shopFrame = true)
+        grip("gift", shop, Entity(), Vector3(-0.22f, BASE_TOP, 0.06f), Vector3(0.09f, 0.08f, 0.09f), optional = true, shopFrame = true)
+        dropMark.addChild(model(MeshResource.createTorus(1f, 0.9f), glow(color(1f, 0.85f, 0.4f, 0.9f))).apply { setScale(0.03f) })
+        shop.addChild(dropMark)
 
         // The gauge: a bar with the good zone and the needle.
         meter.addChild(model(MeshResource.createBox(Vector3(METER_W + 0.012f, 0.03f, 0.004f), 0.003f), darkWood).apply { setPos(Vector3(0f, 0f, -0.003f)) })
@@ -366,6 +419,122 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
         return e
     }
 
+    /** Registers [node] as a tool the hand moves, resting at [rest] in [parent] (a station, or the shop). */
+    private fun grip(id: String, parent: Entity, node: Entity, rest: Vector3, box: Vector3, optional: Boolean = false, shopFrame: Boolean = false) {
+        node.setPos(rest)
+        hit(node, "grip:$id", box)
+        parent.addChild(node)
+        grips[id] = Grip(node, rest, shopFrame)
+        if (optional) {
+            this.optional += id
+            node.enabled = false
+        }
+    }
+
+    /**
+     * Tool model [name] (prepared at 1 m along its longest side, or its height) at [size], turned by
+     * [turn] and raised by [lift]; null when it is not in the APK (the code-built stand-in is used).
+     */
+    private fun tool(name: String, size: Float, turn: EulerAngles, lift: Float = 0f): Entity? {
+        val m = models[name]?.clone(Entity.CloneOptions(true, true)) ?: return null
+        m.setScale(size)
+        m.transform().eulerAngles = turn
+        m.setPos(Vector3(0f, lift, 0f))
+        return Entity().apply { addChild(m) }
+    }
+
+    /** The writing brush: the model lies along z with its tip at +z, so it is turned to hang tip down. */
+    private fun brushModel() = tool("brush", 0.06f, EulerAngles(90f, 0f, 0f)) ?: Entity().apply {
+        addChild(model(MeshResource.createCylinder(0.05f, 0.0025f), bamboo).apply { setPos(Vector3(0f, 0.012f, 0f)) })
+        addChild(model(MeshResource.createCone(0.012f, 0.0035f), pbr(color(0.1f, 0.1f, 0.12f), roughness = 0.8f)).apply { setPos(Vector3(0f, -0.019f, 0f)); transform().eulerAngles = EulerAngles(180f, 0f, 0f) })
+    }
+
+    /** A point in the front station's frame (or the shop's, for [shopFrame]) in the shop's frame. */
+    private fun frontPos(p: Vector3, shopFrame: Boolean) =
+        if (shopFrame) Vec3(p.x.toDouble(), p.y.toDouble(), p.z.toDouble()) else Vec3(p.x.toDouble(), (BENCH_TOP + p.y).toDouble(), (BENCH_Z + STATION_R + p.z).toDouble())
+
+    /** Where the hand has put grip [id], relative to its rest place (shop meters). */
+    fun gripOff(id: String) = grips[id]?.off ?: Vector3(0f, 0f, 0f)
+
+    fun moveGrip(id: String, off: Vector3) {
+        grips[id]?.off = off
+    }
+
+    /** Where grip [id] is now, in the shop's frame. */
+    fun gripAt(id: String): Vec3? = grips[id]?.let { g -> frontPos(Vector3(g.rest.x + g.off.x, g.rest.y + g.off.y, g.rest.z + g.off.z), g.shopFrame) }
+
+    /**
+     * The step's tools: the optional grips in [on] come out (the rest of them are put away), and
+     * those in [glint] sparkle now and then, so the hand knows what to take.
+     */
+    fun tools(on: Set<String>, glint: Set<String>) {
+        for (id in optional) grips[id]?.node?.enabled = id in on
+        for ((id, g) in grips) if (id !in on || id !in optional) g.off = Vector3(0f, 0f, 0f)
+        glinting = glint
+        glintT = 0.3
+    }
+
+    /** Where a carried thing goes (shop frame), shown by a golden ring; null hides the ring. */
+    fun dropAt(id: String?): Vec3? {
+        val at = when (id) {
+            "cloth" -> frontPos(Vector3(-0.045f, 0.07f, -0.035f), false)
+            "stick" -> frontPos(Vector3(0.075f, 0.016f, 0.055f), false)
+            "wrapcloth" -> Vec3(-0.22, (BASE_TOP + 0.03).toDouble(), 0.06)
+            "gift" -> Vec3(-0.3, (BASE_TOP + 0.004).toDouble(), 0.07)
+            else -> null
+        }
+        dropMark.enabled = at != null
+        at?.let { dropMark.setPos(Vector3(it.x.toFloat(), it.y.toFloat(), it.z.toFloat())) }
+        return at
+    }
+
+    /** The beads on the pot's four rings, at their radius (station frame). */
+    private fun placeBeads() {
+        val ys = floatArrayOf(0f, 0.3f, 0.65f, 0.95f)
+        for (i in 0 until 4) grips["ring$i"]?.let { g ->
+            val r = 0.006f + 0.006f * potRings[i]
+            val p = Vector3(-0.045f + r + 0.005f, 0.048f + ys[i] * potH, 0.01f + 0.004f)
+            grips["ring$i"] = Grip(g.node, p, false)
+        }
+    }
+
+    /** What the carried stick, cloth or gift looks like (set when its step begins). */
+    fun carryLook(id: String, made: Made, glossy: Boolean, dragon: Boolean, quality: Double, d: Dye?) {
+        val g = grips[id] ?: return
+        when (id) {
+            "stick" -> { g.node.getChildren().filter { hits[it] == null }.forEach { it.destroy() }; g.node.addChild(inkStickModel(glossy, dragon, quality)) }
+            "cloth", "wrapcloth" -> d?.let { clothTex = swapTexture(clothMat, clothBitmap(it), clothTex) } ?: made.cloth?.let { clothTex = swapTexture(clothMat, clothBitmap(it.dye), clothTex) }
+            "gift" -> {
+                g.node.getChildren().forEach { it.destroy() }
+                val m = PhysicallyBasedMaterial.create().apply {
+                    val dd = made.cloth?.dye
+                    val n = 64
+                    val b = Bitmap.createBitmap(n, n, Bitmap.Config.ARGB_8888)
+                    for (y in 0 until n) for (x in 0 until n) b.setPixel(x, y, indigoPixel(dd?.at((x + 0.5) / n, (y + 0.5) / n) ?: 0.6))
+                    setBaseColorTexture(TextureResource.create(b)); setRoughness(0.9f)
+                }
+                g.node.addChild(model(sphere, m).apply { setPos(Vector3(0f, 0.028f, 0f)); transform().setScaleVector(Vector3(0.042f, 0.03f, 0.042f)) })
+                g.node.addChild(model(sphere, m).apply { setPos(Vector3(0f, 0.062f, 0f)); setScale(0.012f) })
+                g.node.addChild(model(MeshResource.createTorus(0.012f, 0.008f), red).apply { setPos(Vector3(0f, 0.05f, 0f)) })
+            }
+        }
+    }
+
+    /** Ink or blue left by the brush, sawdust by the trimmer, where the tool is. */
+    fun rubMark(id: String) {
+        val at = gripAt(id) ?: return
+        when (id) {
+            "trimmer" -> chips.emit(Vec3(at.x - 0.02, at.y - 0.008, at.z), 2, 0.08, 0.35, 0.0018f)
+            "brush" -> drops.emit(Vec3(at.x, at.y - 0.02, at.z), 1, 0.01, 0.3, 0.0015f)
+            "pen" -> smoke.emit(Vec3(at.x, at.y - 0.02, at.z), 1, 0.01, 0.3, 0.0015f)
+        }
+    }
+
+    /** The bundle goes into the dye: drops when it comes out. */
+    fun dipped() {
+        drops.emit(frontPos(Vector3(0.065f, 0.06f, 0f), false), 10, 0.06, 0.5, 0.002f)
+    }
+
     private fun hit(e: Entity, id: String, size: Vector3, center: Vector3 = Vector3(0f, 0f, 0f)) {
         e.components.set(CollisionComponent(listOf(ShapeResource.createBox(size).offsetByTranslation(center)), PhysicsMaterialResource()))
         e.components.set(InteractableComponent())
@@ -455,7 +624,6 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
     fun wetSheet(thick: Double) {
         wetSheet.enabled = true
         wetSheet.transform().setScaleVector(Vector3(1f, (0.6 + thick * 3).toFloat(), 1f))
-        dipT = 1.0
     }
 
     /** The sheet of paper on the drying board: cream fibers; flaws (specks, clouds) as quality drops. */
@@ -487,14 +655,17 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
      * The pot from its four ring levels (1..6) and its height; [pattern] painted (null not yet),
      * [celadon] glaze (null not yet), [fired] where the kiln was stopped (null not yet).
      */
-    fun pot(rings: IntArray, height: Double, pattern: Int?, celadon: Boolean?, redClay: Boolean, fired: Double?) {
+    fun pot(rings: IntArray, height: Double, pattern: Int?, celadon: Boolean?, redClay: Boolean, fired: Double?, reveal: Float = 1f) {
         potMesh?.destroy()
         potMesh = model(lathe(rings, height.toFloat()), potMat).also { pot.addChild(it) }
-        potTex = swapTexture(potMat, potBitmap(pattern, celadon, redClay, fired, gilded = false), potTex)
+        potTex = swapTexture(potMat, potBitmap(pattern, celadon, redClay, fired, gilded = false, reveal = reveal), potTex)
+        potRings = rings.copyOf()
+        potH = height.toFloat()
+        placeBeads()
         potMat.setRoughness(if (fired == null) 0.85f else if (fired < 0.6) 0.7f else 0.12f)
     }
 
-    private fun potBitmap(pattern: Int?, celadon: Boolean?, redClay: Boolean, fired: Double?, gilded: Boolean): Bitmap {
+    private fun potBitmap(pattern: Int?, celadon: Boolean?, redClay: Boolean, fired: Double?, gilded: Boolean, reveal: Float = 1f): Bitmap {
         val n = 256
         val b = Bitmap.createBitmap(n, n, Bitmap.Config.ARGB_8888)
         val cv = Canvas(b)
@@ -504,7 +675,10 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
             celadon == true -> 0xFFA9CDB4.toInt()
             else -> 0xFFF6F5F0.toInt()
         })
-        if (pattern != null) {
+        if (pattern != null && reveal > 0f) {
+            // Painted so far: the brush goes round the pot, so the pattern shows up to [reveal] of the way.
+            cv.save()
+            cv.clipRect(0f, 0f, n * reveal, n.toFloat())
             val p = Paint().apply { isAntiAlias = true; color = if (fired == null) 0xFF4A4A4A.toInt() else 0xFF23408E.toInt(); strokeWidth = 4f; style = Paint.Style.STROKE }
             cv.drawLine(0f, n * 0.1f, n.toFloat(), n * 0.1f, p)
             cv.drawLine(0f, n * 0.9f, n.toFloat(), n * 0.9f, p)
@@ -528,6 +702,7 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
                     cv.drawCircle(x0 + n / 10f, n * 0.22f, 5f, p)
                 }
             }
+            cv.restore()
         }
         if (gilded) {
             val g = Paint().apply { isAntiAlias = true; color = 0xFFE2B04A.toInt(); strokeWidth = 7f; style = Paint.Style.STROKE }
@@ -615,7 +790,7 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
      * ([bands] 0..4 from the fold). [dips] darkens it. A null fold hides it.
      */
     fun bundleShape(fold: Fold?, bands: Set<Int>, dips: Int) {
-        bundle.getChildren().forEach { it.destroy() }
+        bundle.getChildren().forEach { hits.remove(it); it.destroy() }
         if (fold == null) return
         val len = 0.1f
         bundleMat.setBaseColor(color(0.95f - dips * 0.16f, 0.94f - dips * 0.14f, 0.9f - dips * 0.08f))
@@ -631,14 +806,19 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
         for (b in bands) {
             val x = -len / 2 + len * (0.1f + 0.2f * b)
             val rr = if (fold == Fold.TRIANGLE) 0.016f * (0.1f + 0.2f * b) + 0.003f else 0.016f
-            bundle.addChild(model(MeshResource.createTorus(rr + 0.002f, rr - 0.0005f), rope).apply { setPos(Vector3(x, 0.012f, 0f)); transform().eulerAngles = EulerAngles(0f, 0f, 90f) })
+            bundle.addChild(model(MeshResource.createTorus(rr + 0.002f, rr - 0.0005f), rope).apply {
+                setPos(Vector3(x, 0.012f, 0f))
+                transform().eulerAngles = EulerAngles(0f, 0f, 90f)
+                hit(this, "band:$b", Vector3(0.012f, 0.04f, 0.04f))
+            })
         }
     }
 
-    /** The bundle goes into the vat and out, twice. */
-    fun dyeing() {
-        dyeT = 1.6
-    }
+    /** The dye vat's mouth (shop frame): the bundle below it and over it is in the dye. */
+    fun dyeVat() = frontPos(Vector3(0.065f, 0.045f, 0f), false)
+
+    /** Where band [b] (0..4) is tied along the bundle (station frame, x). */
+    fun bandX(b: Int) = BUNDLE_REST.x - 0.05f + 0.1f * (0.1f + 0.2f * b)
 
     /** The ink stick: black, glossy with more glue, with a gold dragon when asked. */
     fun ink(glossy: Boolean, dragon: Boolean, quality: Double) {
@@ -656,7 +836,7 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
     }
 
     /** The New Year gift before the guest: the couplet on the player's paper, the bowl in the player's cloth. */
-    fun gift(lines: Pair<String, String>?, wrapped: Boolean, made: Made) {
+    fun gift(lines: Pair<String, String>?, wrapped: Boolean, made: Made, bowl: Boolean = true) {
         gift.getChildren().forEach { it.destroy() }
         gift.setPos(Vector3(-0.22f, BASE_TOP, 0.06f))
         if (lines != null) {
@@ -671,7 +851,9 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
             }
         }
         val p = made.pot
-        if (wrapped) {
+        if (!bowl) {
+            // The wrapped bowl is in the player's hand (the 送礼 step).
+        } else if (wrapped) {
             val m = PhysicallyBasedMaterial.create().apply {
                 val d = made.cloth?.dye
                 val n = 64
@@ -786,6 +968,7 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
     /** The vat steaming as it boils, [heat] 0..1 (the pulp's color follows). */
     fun boil(heat: Double) {
         pulpColor(heat)
+        if (heat > 0.03 && (clock * 20).toInt() % 2 == 0) sparks.emit(frontPos(Vector3(-0.065f, 0.02f, 0.035f), false), 1 + (heat * 3).toInt(), 0.02, 0.35 + heat * 0.3, (0.002 + heat * 0.004).toFloat(), Vec3(0.0, 0.05 + heat * 0.05, -0.01))
         if ((clock * 12).toInt() % 2 == 0) steam.emit(Vec3(-0.065, BENCH_TOP + 0.04, BENCH_Z + STATION_R - 0.01), 1, 0.02, 1.2, (0.004 + 0.006 * heat).toFloat(), Vec3(0.0, 0.04 + 0.04 * heat, 0.0))
     }
 
@@ -887,18 +1070,15 @@ class WorkshopView(private val models: Map<String, Entity>, private val tex: Map
         yaw += (yawGoal - yaw) * (1 - exp(-dt * 2.5)).toFloat()
         bench.transform().eulerAngles = EulerAngles(0f, yaw, 0f)
         if (strikeT > 0) strikeT -= dt
-        val down = sin((strikeT / 0.25).coerceIn(0.0, 1.0) * Math.PI)
-        pestle.setPos(Vector3(0.065f, (0.1 - 0.05 * if (strikeAt == Craft.PAPER) down else 0.0).toFloat(), -0.025f))
-        hammer.transform().eulerAngles = EulerAngles(0f, 0f, (-35 * if (strikeAt == Craft.INK) down else 0.0).toFloat())
-        if (dipT > 0) dipT -= dt
-        mould.setPos(Vector3(-0.065f, (0.06 - 0.042 * sin(dipT.coerceIn(0.0, 1.0) * Math.PI)).toFloat(), -0.01f))
-        if (!pestle.enabled) mortar?.transform()?.setScaleVector(Vector3(1f, (1 - 0.08 * if (strikeAt == Craft.PAPER) down else 0.0).toFloat(), 1f))
-        if (dyeT > 0) {
-            dyeT -= dt
-            // Over the vat, in and out twice; then back.
-            val d = sin(dyeT * Math.PI * 2 / 1.6 * 2).coerceAtLeast(0.0)
-            bundle.setPos(if (dyeT > 0.05) Vector3(0.065f, (0.07 - 0.05 * d).toFloat(), 0f) else BUNDLE_REST)
-            if (d > 0.95) drops.emit(Vec3(0.0, BENCH_TOP + 0.06, (BENCH_Z + STATION_R).toDouble()), 2, 0.06, 0.4, 0.002f)
+        // The tools the hand holds sit where the hand put them; a pinched one glints now and then.
+        for ((id, g) in grips) g.node.setPos(Vector3(g.rest.x + g.off.x, g.rest.y + g.off.y, g.rest.z + g.off.z))
+        glintT -= dt
+        if (glintT <= 0) {
+            glintT = 1.6
+            for (id in glinting) grips[id]?.takeIf { it.node.enabled }?.let { g ->
+                val f = frontPos(Vector3(g.rest.x + g.off.x, g.rest.y + g.off.y + 0.02f, g.rest.z + g.off.z), g.shopFrame)
+                stars.emit(f, 5, 0.04, 0.6, 0.0022f, Vec3(0.0, 0.02, 0.0))
+            }
         }
         if (wheelSpin) pot.transform().eulerAngles = EulerAngles(0f, (clock * 220).toFloat(), 0f)
         if (flash > 0) flash -= dt

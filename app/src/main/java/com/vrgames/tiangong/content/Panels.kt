@@ -127,6 +127,7 @@ fun OrderPanel(c: PhysicalLengthConverter) {
         if (o.craft != Craft.GIFT) Text("三星：每道工序都做到位（品质 92% 以上），不用提示。", fontSize = c.sz(0.013f), color = Dim)
         Row(horizontalArrangement = Arrangement.spacedBy(c.m(0.008f))) {
             CallToAction(c, "开工 →") { Game.begin() }
+            Pill(c, if (Game.speaking) "停止讲解" else "听《天工开物》讲解", Indigo) { Game.toggleVoice() }
             Pill(c, "返回") { Game.toCard() }
         }
     }
@@ -153,24 +154,30 @@ fun StepPanel(c: PhysicalLengthConverter, toggle: (String) -> Unit) {
                 s.options.forEachIndexed { i, opt -> Pill(c, opt, Ink) { Game.choose(i) } }
             }
             is Step.Gauge -> {
-                Text("指针进了绿色区域就捏一下工位。左边${s.low}，右边${s.high}。", fontSize = c.sz(0.012f), color = Dim)
-                CallToAction(c, "停！") { Game.stop() }
+                Text("工位上方的刻度条：左边${s.low}，右边${s.high}，绿色是订单要的。现在 ${(w.gauge * 100).toInt()}%。慢慢调，不限时间。", fontSize = c.sz(0.012f), color = Dim)
+                if (s.tool != "竹帘") CallToAction(c, GAUGE_DONE[s.title] ?: "定了 →") { Game.stop() }
             }
             is Step.Rhythm -> {
-                Text("已捶 ${w.hits} / ${s.count}" + if (w.misses > 0) "　没打准 ${w.misses}" else "", fontSize = c.sz(0.015f), color = if (w.misses > 0) Rust else Ink)
-                Text("小球碰到光环时捏一下工位。", fontSize = c.sz(0.012f), color = Dim)
-                CallToAction(c, "捶！") { Game.strike() }
+                Text("已捶 ${w.hits} / ${s.count}", fontSize = c.sz(0.016f), color = Ink)
+                Text("捏住${s.tool}往下砸到底再抬起来算一下；也可以松手让它弹回去再捏。", fontSize = c.sz(0.012f), color = Dim)
             }
             is Step.Shape -> ShapeControls(c, w.rings, s)
             is Step.Tie -> TieControls(c)
             is Step.Tap -> {
-                Text("捏一下工位，或者点这里：", fontSize = c.sz(0.012f), color = Dim)
-                CallToAction(c, s.title + " →") { Game.tap() }
+                Text(
+                    when (s.gesture) {
+                        Step.Gesture.STROKES -> "已经 ${(w.progress * s.strokes + 0.01).toInt()} / ${s.strokes} 下"
+                        Step.Gesture.RUB -> "做了 ${(w.progress * 100).toInt()}%"
+                        Step.Gesture.CARRY -> "拖到发亮的金圈里松开。"
+                    },
+                    fontSize = c.sz(0.015f), color = Ink,
+                )
             }
         }
         Game.lastVerdict?.let { Text(it, fontSize = c.sz(0.013f), color = Indigo) }
         Row(horizontalArrangement = Arrangement.spacedBy(c.m(0.005f))) {
             Pill(c, "提示（扣星）", Gilt) { Game.hint() }
+            Pill(c, if (Game.speaking) "停止讲解" else "听讲解", Indigo) { Game.toggleVoice() }
             Pill(c, "订单簿", Indigo) { toggle(ORDERS_ID) }
             Pill(c, "图谱") { toggle(BOOK_ID) }
         }
@@ -185,17 +192,17 @@ private fun ShapeControls(c: PhysicalLengthConverter, rings: IntArray, s: Step.S
         Column(verticalArrangement = Arrangement.spacedBy(c.m(0.004f))) {
             for (i in 3 downTo 0) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(c.m(0.004f))) {
                 Text("${i + 1} ${RING_NAMES[i]}", Modifier.width(c.m(0.04f)), fontSize = c.sz(0.012f), color = Dim)
-                Pill(c, "收", Ink) { Game.ring(i, -1) }
-                Text("${rings[i]}", fontSize = c.sz(0.014f), color = Gilt)
-                Pill(c, "放", Ink) { Game.ring(i, 1) }
+                Text("${rings[i]} 档", fontSize = c.sz(0.014f), color = if (rings[i] == s.target[i]) Indigo else Gilt)
             }
         }
     }
-    Text("白色是你的坯，金色虚线是图样。", fontSize = c.sz(0.012f), color = Dim)
+    Text("白色是你的坯，金色虚线是图样。捏住坯上的金色小珠：往右拉放宽，往左推收窄。", fontSize = c.sz(0.012f), color = Dim)
     CallToAction(c, "拉好了 →") { Game.shaped() }
 }
 
 private val RING_NAMES = listOf("底", "腹", "肩", "口")
+
+private val GAUGE_DONE = mapOf("蒸煮" to "火候定了 →", "烧窑" to "封窑 →", "烧烟" to "灯芯定了 →")
 
 @Composable
 private fun TieControls(c: PhysicalLengthConverter) {
@@ -205,17 +212,11 @@ private fun TieControls(c: PhysicalLengthConverter) {
         for (f in Fold.entries) Pill(c, f.label, Ink, selected = w.fold == f) { Game.fold(f) }
     }
     Text(FOLD_NOTES[w.fold] ?: "先选一种折法，工位前会摆出折好的布。", fontSize = c.sz(0.012f), color = Dim)
-    Text("扎绳（1 靠近折痕，5 在最外）", fontSize = c.sz(0.013f), color = Dim)
-    Row(horizontalArrangement = Arrangement.spacedBy(c.m(0.004f))) {
-        for (b in 0 until 5) Pill(c, "${b + 1}", Gilt, selected = b in w.bands) { Game.band(b) }
-    }
+    Text("扎绳：" + if (w.bands.isEmpty()) "还没扎。把绳圈拖到布束上松开（左端红签是折痕，第 1 道最靠近它）。" else "已扎第 ${w.bands.sorted().joinToString("、") { (it + 1).toString() }} 道。", fontSize = c.sz(0.013f), color = Dim)
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(c.m(0.006f))) {
-        Text("染几次", fontSize = c.sz(0.013f), color = Dim)
-        Pill(c, "－", Ink) { Game.dips(-1) }
-        Text("${w.dips}", fontSize = c.sz(0.016f), color = Gilt)
-        Pill(c, "＋", Ink) { Game.dips(1) }
+        Text("已浸染缸 ${w.dips} 次（最多 5 次）", fontSize = c.sz(0.014f), color = Ink)
         Spacer(Modifier.width(c.m(0.01f)))
-        CallToAction(c, "染 →") { Game.dye() }
+        CallToAction(c, "拆开看看 →") { Game.dye() }
     }
 }
 

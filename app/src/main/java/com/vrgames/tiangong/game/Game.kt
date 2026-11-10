@@ -16,6 +16,7 @@ import com.vrgames.tiangong.core.Orders
 import com.vrgames.tiangong.core.Progress
 import com.vrgames.tiangong.core.Step
 import com.vrgames.tiangong.core.Vec3
+import com.pico.spatial.core.math.Vector3
 import com.vrgames.tiangong.core.Work
 import com.vrgames.tiangong.render.Music
 import com.vrgames.tiangong.render.Sfx
@@ -58,7 +59,6 @@ object Game {
     val stops = HashMap<String, Double>()
     /** What the last scored step came to, said under the step panel. */
     var lastVerdict by mutableStateOf<String?>(null)
-    private var lastBounce = -1
     private var dyeing = false
 
     var window by mutableStateOf<String?>(null); private set
@@ -76,7 +76,48 @@ object Game {
         if (window == id) window = null
     }
 
+    // ---- v0.2: narration from 天工开物, one clip per craft and one for the gift ----
+    private var app: Context? = null
+    private var player: android.media.MediaPlayer? = null
+    private val heard = HashSet<Craft>()
+    var speaking by mutableStateOf(false); private set
+
+    private fun clipOf(c: Craft) = when (c) {
+        Craft.PAPER -> "paper"
+        Craft.PORCELAIN -> "porcelain"
+        Craft.DYE -> "dye"
+        Craft.INK -> "ink"
+        Craft.GIFT -> "gift"
+    }
+
+    fun speak(c: Craft) {
+        stopVoice()
+        val a = app ?: return
+        runCatching {
+            val fd = a.assets.openFd("narration/${clipOf(c)}.ogg")
+            player = android.media.MediaPlayer().apply {
+                setDataSource(fd.fileDescriptor, fd.startOffset, fd.length)
+                fd.close()
+                setOnCompletionListener { stopVoice() }
+                prepare()
+                start()
+            }
+            speaking = true
+        }.onFailure { Log.w(TAG, "narration $c: ${it.message}") }
+    }
+
+    fun toggleVoice() {
+        if (speaking) stopVoice() else speak(order.craft)
+    }
+
+    fun stopVoice() {
+        player?.let { runCatching { it.stop() }; runCatching { it.release() } }
+        player = null
+        speaking = false
+    }
+
     fun init(context: Context) {
+        app = context.applicationContext
         if (prefs != null) return
         prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).also { p ->
             musicOn = p.getBoolean("music", true)
@@ -129,6 +170,8 @@ object Game {
             if (o.craft == Craft.GIFT) v.gift(null, false, made)
         }
         phase = Phase.ORDER
+        // The first order of each craft in a session reads the book's words on it.
+        if (heard.add(o.craft)) speak(o.craft) else stopVoice()
         version++
     }
 
@@ -145,8 +188,13 @@ object Game {
         val s = w.step ?: return
         v?.meterOff()
         v?.beatOff()
-        v?.spin(s is Step.Shape)
-        lastBounce = 0
+        v?.spin(s is Step.Shape || s is Step.Tap && (s.action == "trim" || s.action == "paint"))
+        held = null
+        armed = true
+        inVat = false
+        val (on, glint) = gripsFor(s)
+        v?.tools(on, glint)
+        v?.dropAt(null)
         when (s) {
             is Step.Gauge -> {
                 val (lo, hi) = GAUGE_COLORS[s.title] ?: (0xFF555555.toInt() to 0xFFEEEEEE.toInt())
@@ -158,12 +206,235 @@ object Game {
             is Step.Tie -> {
                 w.fold = null
                 w.bands.clear()
-                w.dips = 1
                 v?.bundleShape(null, emptySet(), 0)
+            }
+            is Step.Tap -> {
+                if (s.action == "paint") showPot(reveal = 0f)
+                if (s.gesture == Step.Gesture.CARRY) {
+                    val id = on.first()
+                    v?.carryLook(id, made, picks["和胶"] == 1, picks["入模"] == 1, w.quality, w.dye())
+                    if (id == "gift") v?.gift(couplet(), true, made, bowl = false)
+                    v?.dropAt(id)
+                }
             }
             else -> Unit
         }
         say(s.say)
+    }
+
+    // ---- v0.2: the hand on the tools ----
+
+    /** The tool held (a grip id), whether the next stroke may count (the tool came back up), the bundle in the dye. */
+    private var held: String? = null
+    private var armed = true
+    private var inVat = false
+    private var shapeAcc = 0.0
+
+    /** The tools a step uses: those to bring out and those to make glint. */
+    private fun gripsFor(s: Step?): Pair<Set<String>, Set<String>> = when (s) {
+        is Step.Gauge -> setOf(GAUGE_GRIP[s.tool] ?: "fire").let { it to it }
+        is Step.Rhythm -> setOf(if (s.tool == "墨锤") "hammer" else "pestle").let { it to it }
+        is Step.Shape -> (0 until 4).map { "ring$it" }.toSet().let { it to it }
+        is Step.Tie -> setOf("rope", "bundle") to setOf(if (work?.fold == null) "" else if ((work?.bands?.size ?: 0) == 0) "rope" else "bundle")
+        is Step.Tap -> setOf(
+            when (s.action) {
+                "chop" -> "knife"
+                "press" -> "press"
+                "trim" -> "trimmer"
+                "paint" -> "brush"
+                "write" -> "pen"
+                "wrap" -> "wrapcloth"
+                "give" -> "gift"
+                else -> if (order.craft == Craft.DYE) "cloth" else "stick"
+            },
+        ).let { it to it }
+        else -> emptySet<String>() to emptySet()
+    }
+
+    /** The hand closes on a tool: holds it if this step uses it, else says which one to take. */
+    fun grab(id: String): Boolean {
+        if (phase != Phase.MAKING) return false
+        val g = id.removePrefix("grip:")
+        val s = work?.step ?: return false
+        val (on, _) = gripsFor(s)
+        if (g !in on) {
+            if (s is Step.Choice) say("这一步先在面板上选：${s.say}") else say("这一步用不到它。" + s.say)
+            return false
+        }
+        if (s is Step.Tie && g == "bundle" && work?.fold == null) {
+            say("先在面板上选一种折法，把布折好。")
+            return false
+        }
+        held = g
+        shapeAcc = 0.0
+        sfx(Sfx.TOOL)
+        return true
+    }
+
+    /** The held tool moves by [d] (shop meters). */
+    fun dragBy(d: Vec3) {
+        val id = held ?: return
+        val w = work ?: return
+        val v = view ?: return
+        val o = v.gripOff(id)
+        var x = o.x + d.x
+        var y = o.y + d.y
+        var z = o.z + d.z
+        when (val s = w.step) {
+            is Step.Gauge -> if (id == "mould") {
+                x = x.coerceIn(-0.012, 0.012); z = z.coerceIn(-0.012, 0.012); y = y.coerceIn(-0.046, 0.04)
+                val depth = (-y / 0.044).coerceIn(0.0, 1.0)
+                if (depth > w.gauge) {
+                    w.setGauge(depth)
+                    v.gauge(depth)
+                    v.wetSheet(depth)
+                }
+                if (depth > 0.1 && (y + 0.046) < 0.004) v.dipped()
+                if (y > 0.025 && w.gauge > 0.08) {
+                    v.moveGrip(id, Vector3(x.toFloat(), y.toFloat(), z.toFloat()))
+                    held = null
+                    stop()
+                    return
+                }
+            } else {
+                x = 0.0; z = 0.0; y = y.coerceIn(0.0, 0.06)
+                w.setGauge(y / 0.06)
+                v.gauge(w.gauge)
+            }
+            is Step.Rhythm -> { x = 0.0; z = 0.0; y = y.coerceIn(-0.05, 0.03); stroke(y) }
+            is Step.Tap -> when (s.gesture) {
+                Step.Gesture.STROKES -> { x = 0.0; z = 0.0; y = y.coerceIn(-0.045, 0.03); stroke(y) }
+                Step.Gesture.RUB -> {
+                    x = x.coerceIn(-0.04, 0.04); y = y.coerceIn(-0.02, 0.02); z = z.coerceIn(-0.03, 0.03)
+                    val moved = kotlin.math.sqrt((x - o.x) * (x - o.x) + (y - o.y) * (y - o.y) + (z - o.z) * (z - o.z))
+                    v.moveGrip(id, Vector3(x.toFloat(), y.toFloat(), z.toFloat()))
+                    rub(moved)
+                    return
+                }
+                Step.Gesture.CARRY -> {
+                    x = x.coerceIn(-0.35, 0.35); y = y.coerceIn(-0.02, 0.2); z = z.coerceIn(-0.3, 0.2)
+                    v.moveGrip(id, Vector3(x.toFloat(), y.toFloat(), z.toFloat()))
+                    val at = v.gripAt(id)
+                    val to = v.dropAt(id)
+                    if (at != null && to != null && at.distanceTo(to) < CARRY_NEAR) carried()
+                    return
+                }
+            }
+            is Step.Shape -> {
+                // Out widens the ring, in narrows it: one level per centimetre of hand motion.
+                val i = id.removePrefix("ring").toIntOrNull() ?: return
+                shapeAcc += d.x
+                while (shapeAcc > SHAPE_STEP) { shapeAcc -= SHAPE_STEP; ring(i, 1) }
+                while (shapeAcc < -SHAPE_STEP) { shapeAcc += SHAPE_STEP; ring(i, -1) }
+                return
+            }
+            is Step.Tie -> {
+                x = x.coerceIn(-0.12, 0.12); y = y.coerceIn(-0.01, 0.1); z = z.coerceIn(-0.1, 0.08)
+                if (id == "bundle") {
+                    v.moveGrip(id, Vector3(x.toFloat(), y.toFloat(), z.toFloat()))
+                    val at = v.gripAt("bundle") ?: return
+                    val vat = v.dyeVat()
+                    val over = kotlin.math.hypot(at.x - vat.x, at.z - vat.z) < 0.04
+                    if (over && at.y < vat.y) inVat = true
+                    if (inVat && (at.y > vat.y + 0.03 || !over)) {
+                        inVat = false
+                        dipOnce()
+                    }
+                    return
+                }
+            }
+            else -> return
+        }
+        v.moveGrip(id, Vector3(x.toFloat(), y.toFloat(), z.toFloat()))
+    }
+
+    /** The hand opens. */
+    fun release() {
+        val id = held ?: return
+        held = null
+        val w = work ?: return
+        val v = view ?: return
+        when (val s = w.step) {
+            is Step.Gauge -> if (id == "mould") {
+                if (w.gauge > 0.08) stop() else v.moveGrip(id, Vector3(0f, 0f, 0f))
+            }
+            is Step.Tie -> {
+                if (id == "rope") {
+                    // Let go on the bundle: tied at the nearest of the five places.
+                    val at = v.gripAt("rope")
+                    val b = v.gripAt("bundle")
+                    if (at != null && b != null && kotlin.math.abs(at.z - b.z) < 0.035 && kotlin.math.abs(at.x - b.x) < 0.07) {
+                        // Band places are measured from the bundle's middle (band 2 sits there).
+                        val along = (at.x - b.x).toFloat()
+                        val pick = (0 until 5).minBy { kotlin.math.abs((v.bandX(it) - v.bandX(2)) - along) }
+                        if (pick !in w.bands) band(pick) else say("第 ${pick + 1} 道已经扎好了。捏一下扎好的绳可以拆掉。")
+                    }
+                } else if (inVat) {
+                    inVat = false
+                    dipOnce()
+                }
+                v.moveGrip(id, Vector3(0f, 0f, 0f))
+            }
+            is Step.Tap -> {
+                if (s.gesture != Step.Gesture.CARRY || w.step === s) v.moveGrip(id, Vector3(0f, 0f, 0f))
+                // The tool springs back up: the next push down is a new stroke (emulator 2026-11-10: the
+                // second chop never counted without this).
+                armed = true
+            }
+            is Step.Rhythm -> { v.moveGrip(id, Vector3(0f, 0f, 0f)); armed = true }
+            else -> Unit
+        }
+    }
+
+    /** The tool at height [y] (from rest): coming down past the bottom after being up is one stroke. */
+    private fun stroke(y: Double) {
+        if (y > -0.01) armed = true
+        if (!armed || y > -0.038) return
+        armed = false
+        val w = work ?: return
+        when (val s = w.step) {
+            is Step.Rhythm -> strike()
+            is Step.Tap -> {
+                val v = view
+                if (s.action == "chop") { v?.chop(); sfx(Sfx.CHOP) } else { v?.strike(true); sfx(Sfx.DROP) }
+                if (w.advance(1.0 / s.strokes)) tapDone(s)
+                version++
+            }
+            else -> Unit
+        }
+    }
+
+    private fun rub(moved: Double) {
+        val w = work ?: return
+        val s = w.step as? Step.Tap ?: return
+        val v = view
+        held?.let { v?.rubMark(it) }
+        if (s.action == "paint") showPot(reveal = w.progress.toFloat().coerceIn(0f, 1f))
+        if ((w.progress * 10).toInt() != ((w.progress + moved / Step.RUB_M) * 10).toInt()) sfx(if (s.action == "trim") Sfx.TOOL else Sfx.CLOTH)
+        if (w.advance(moved / Step.RUB_M)) {
+            held = null
+            tapDone(s)
+        }
+        version++
+    }
+
+    private fun carried() {
+        val w = work ?: return
+        val s = w.step as? Step.Tap ?: return
+        held = null
+        w.advance(1.0)
+        tapDone(s)
+    }
+
+    private fun dipOnce() {
+        val w = work ?: return
+        if (w.step !is Step.Tie) return
+        w.dip()
+        view?.dipped()
+        view?.bundleShape(w.fold, w.bands, w.dips)
+        sfx(Sfx.DIP)
+        say("浸了 ${w.dips} 次。" + if (w.dips >= 5) "最多浸五次。" else "")
+        version++
     }
 
     // ---- The player's moves ----
@@ -215,11 +486,11 @@ object Game {
         val w = work ?: return
         val s = w.step as? Step.Rhythm ?: return
         if (phase != Phase.MAKING) return
-        val ok = w.strike()
-        view?.strike(ok)
-        sfx(if (ok) Sfx.POUND else Sfx.MISS)
+        w.strike()
+        view?.strike(true)
+        sfx(Sfx.POUND)
         if (w.step !== s) {
-            lastVerdict = "${s.title}：${w.scores.last().let { if (it >= 0.99) "每一下都在点上！" else "有几下没打在点上（${(it * 100).toInt()} 分）。" }}"
+            lastVerdict = "${s.title}：捶够了 ${s.count} 下。"
             afterStep()
         }
         version++
@@ -250,79 +521,66 @@ object Game {
         if (w.step !is Step.Tie || dyeing) return
         w.fold = f
         sfx(Sfx.CLOTH)
-        view?.bundleShape(f, w.bands, 0)
+        view?.bundleShape(f, w.bands, w.dips)
+        view?.tools(gripsFor(w.step).first, gripsFor(w.step).second)
         version++
     }
 
     fun band(b: Int) {
         val w = work ?: return
         if (w.step !is Step.Tie || dyeing) return
+        if (w.dips > 0) { say("已经浸过染缸了，扎绳不能再改。"); return }
         if (!w.bands.remove(b)) w.bands += b
         sfx(Sfx.TOOL)
-        view?.bundleShape(w.fold, w.bands, 0)
+        view?.bundleShape(w.fold, w.bands, w.dips)
+        view?.tools(gripsFor(w.step).first, gripsFor(w.step).second)
         version++
     }
 
-    fun dips(by: Int) {
-        val w = work ?: return
-        if (w.step !is Step.Tie || dyeing) return
-        w.dips = (w.dips + by).coerceIn(1, 5)
-        sfx(Sfx.TOOL)
-        version++
-    }
 
     /** Into the vat: the bundle dips, then the cloth is opened on the rack and scored. */
     fun dye() {
         val w = work ?: return
         val s = w.step as? Step.Tie ?: return
         if (phase != Phase.MAKING || dyeing) return
-        val d = w.dye() ?: run { say("先选一种折法。"); return }
-        dyeing = true
-        view?.bundleShape(d.fold, d.bands, d.dips)
-        view?.dyeing()
-        sfx(Sfx.DIP)
-        main.postDelayed({
-            if (work !== w) return@postDelayed
-            dyeing = false
-            val sc = w.dyed()
-            view?.bundleShape(null, emptySet(), 0)
-            view?.cloth(d)
-            sfx(if (sc >= 0.99) Sfx.GOOD else Sfx.CLOTH)
-            lastVerdict = "${s.title}：" + if (sc >= 0.99) "花纹和订单一模一样！" else "和订单的花纹${if (sc > 0.5) "有点" else "很"}不一样（${(sc * 100).toInt()} 分）。"
-            afterStep()
-        }, 1700)
+        if (w.fold == null) { say("先在面板上选一种折法。"); return }
+        val d = w.dye() ?: run { say("还没浸过染缸：捏住布束，浸进右边的染缸再提出来。"); return }
+        val sc = w.dyed()
+        view?.bundleShape(null, emptySet(), 0)
+        sfx(if (sc >= 0.99) Sfx.GOOD else Sfx.CLOTH)
+        lastVerdict = "${s.title}：" + if (sc >= 0.99) "花纹和订单一模一样！" else "和订单的花纹${if (sc > 0.5) "有点" else "很"}不一样（${(sc * 100).toInt()} 分）。"
+        // The next step carries this cloth to the rack.
+        view?.carryLook("cloth", made, false, false, w.quality, d)
+        afterStep()
         version++
     }
 
-    /** A plain step (cut, press, dry, write, wrap, give). */
-    fun tap() {
+    /** A hand-done step is finished: what it leaves on the bench. */
+    private fun tapDone(s: Step.Tap) {
         val w = work ?: return
-        val s = w.step as? Step.Tap ?: return
-        if (phase != Phase.MAKING) return
         val v = view
+        v?.dropAt(null)
         when (s.action) {
-            "chop" -> { v?.chop(); sfx(Sfx.CHOP) }
+            "chop" -> sfx(Sfx.GOOD)
             "press" -> { v?.paper(w.quality, stops["抄纸"] ?: 0.5, picks["选竹"] != 1); sfx(Sfx.DROP) }
-            "trim" -> { v?.trim(); sfx(Sfx.TOOL) }
-            "dry" -> { if (order.craft == Craft.INK) v?.ink(picks["和胶"] == 1, picks["入模"] == 1, w.quality); sfx(Sfx.CLOTH) }
+            "trim" -> { v?.trim(); sfx(Sfx.GOOD) }
+            "paint" -> { showPot(); sfx(Sfx.GOOD) }
+            "dry" -> {
+                if (order.craft == Craft.INK) v?.ink(picks["和胶"] == 1, picks["入模"] == 1, w.quality) else v?.cloth(w.dye())
+                sfx(Sfx.CLOTH)
+            }
             "write" -> { v?.gift(couplet(), false, made); sfx(Sfx.CLOTH) }
             "wrap" -> { v?.gift(couplet(), true, made); sfx(Sfx.CLOTH) }
             "give" -> { v?.bow(); sfx(Sfx.GIFT) }
         }
-        w.tap()
+        v?.tools(emptySet(), emptySet())
         afterStep()
     }
 
-    /** A pinch on the front station or a tool: does the step's action when it has one. */
+    /** A quick pinch: on a tied band, unties it. */
     fun pinchWork(id: String) {
         if (phase != Phase.MAKING) return
-        when (work?.step) {
-            is Step.Gauge -> stop()
-            is Step.Rhythm -> strike()
-            is Step.Tap -> tap()
-            is Step.Tie -> if (id == "tool:dyevat") dye()
-            else -> Unit
-        }
+        if (work?.step is Step.Tie && id.startsWith("band:")) id.removePrefix("band:").toIntOrNull()?.let { band(it) }
     }
 
     fun hint() {
@@ -339,10 +597,13 @@ object Game {
         return parts[0] to parts.getOrElse(1) { "" }
     }
 
-    private fun showPot() {
+    private fun showPot(reveal: Float = 1f) {
         val w = work ?: return
         val shape = order.steps.firstOrNull { it is Step.Shape } as? Step.Shape ?: return
-        view?.pot(w.rings, shape.height, picks["画青花"], picks["上釉"]?.let { it == 1 }, picks["选土"] == 1, stops["烧窑"])
+        val painted = order.steps.indexOfFirst { it is Step.Tap && it.action == "paint" }
+        // The pattern shows once the brush has been round (or while it goes round).
+        val r = if (painted >= 0 && w.at < painted) 0f else if (painted >= 0 && w.at == painted) reveal else 1f
+        view?.pot(w.rings, shape.height, picks["画青花"], picks["上釉"]?.let { it == 1 }, picks["选土"] == 1, stops["烧窑"], r)
     }
 
     private fun afterStep() {
@@ -411,34 +672,11 @@ object Game {
         if (phase != Phase.MAKING) return
         val s = w.step
         val v = view
-        when (s) {
-            is Step.Gauge -> {
-                val at = w.gauge
-                w.tick(dt)
-                if (w.step !== s) {
-                    // The needle ran to the end.
-                    stopped(s, 1.0, w.scores.last())
-                    lastVerdict = "${s.title}：太晚了，指针走到了头。"
-                    afterStep()
-                    return
-                }
-                v?.gauge(w.gauge)
-                when (s.title) {
-                    "蒸煮" -> v?.boil(at)
-                    "烧窑" -> v?.kiln(at)
-                    "烧烟" -> v?.soot(at)
-                }
-            }
-            is Step.Rhythm -> {
-                w.tick(dt)
-                v?.beat(w.beat)
-                val bounce = ((w.rhythmT + s.period / 2) / s.period).toInt()
-                if (bounce != lastBounce) {
-                    lastBounce = bounce
-                    sfx(Sfx.BEAT)
-                }
-            }
-            else -> Unit
+        // Nothing is timed: the fires burn as high as the hand has set them.
+        if (s is Step.Gauge) when (s.title) {
+            "蒸煮" -> v?.boil(w.gauge)
+            "烧窑" -> v?.kiln(w.gauge)
+            "烧烟" -> v?.soot(w.gauge)
         }
     }
 
@@ -489,6 +727,11 @@ object Game {
         "烧窑" to (0xFF5A1A0A.toInt() to 0xFFFFF2B0.toInt()),
         "烧烟" to (0xFF402010.toInt() to 0xFFFF9A30.toInt()),
     )
+
+    /** Which grip sets each gauge step's amount. */
+    private val GAUGE_GRIP = mapOf("柴火" to "fire", "竹帘" to "mould", "风箱" to "bellows", "灯芯" to "wick")
+    private const val CARRY_NEAR = 0.035
+    private const val SHAPE_STEP = 0.01
 
     // Debug hooks (AutoPilot).
     var debugOpen by mutableStateOf<String?>(null)

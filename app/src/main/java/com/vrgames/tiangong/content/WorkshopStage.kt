@@ -31,6 +31,10 @@ import com.pico.spatial.ui.foundation.content.SpatialViewAttachments
 import com.pico.spatial.ui.foundation.content.toColor4
 import com.pico.spatial.ui.foundation.gesture.TargetEntity
 import com.pico.spatial.ui.foundation.gesture.detectSpatialPointerEvent
+import com.pico.spatial.ui.foundation.gesture.detectSpatialDragGesture
+import com.pico.spatial.ui.platform.LengthUnit
+import android.os.SystemClock
+import com.vrgames.tiangong.core.Vec3
 import com.pico.spatial.ui.platform.LocalPhysicalLengthConverter
 import com.pico.spatial.ui.platform.containers.LocalSpatialNavigator
 import com.vrgames.tiangong.BOOK_ID
@@ -63,6 +67,14 @@ fun WorkshopStage() {
     var view by remember { mutableStateOf<WorkshopView?>(null) }
     val place = remember { Place() }
     val panels = remember { HashMap<String, Entity>() }
+    val drag = remember { longArrayOf(0L, 0L) } // [0]: holding a tool (1/0), [1]: last drag callback (uptime ms)
+    val letGo: (String) -> Unit = { why ->
+        if (drag[0] == 1L) {
+            drag[0] = 0L
+            Log.i(INPUT_TAG, "let go ($why)")
+            Game.release()
+        }
+    }
     val appVersion = remember { runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull().orEmpty() }
 
     val toggleWindow: (String) -> Unit = { id ->
@@ -98,7 +110,7 @@ fun WorkshopStage() {
             Game.music = it
         }
         val observer = androidx.lifecycle.LifecycleEventObserver { _, e ->
-            if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) music.resume() else if (e == androidx.lifecycle.Lifecycle.Event.ON_PAUSE) music.pause()
+            if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) music.resume() else if (e == androidx.lifecycle.Lifecycle.Event.ON_PAUSE) { music.pause(); Game.stopVoice() }
         }
         lifecycle.addObserver(observer)
         onDispose {
@@ -154,18 +166,47 @@ fun WorkshopStage() {
     }
 
     SpatialView(
-        Modifier.pointerInput(Unit) {
-            detectSpatialPointerEvent(context, TargetEntity.any()) { infos ->
-                val v = view
-                if (v != null) for (i in infos) {
-                    if (!i.isDownEvent()) continue
-                    val id = v.hitOf(i.targetedEntity) ?: continue
-                    Log.i(INPUT_TAG, "pinch $id")
-                    main.post { Game.pinchWork(id) }
+        Modifier
+            .pointerInput(Unit) {
+                // v0.2: the tools are taken in the hand and moved (dragged), never timed.
+                fun meters(px: Float) = with(density) { converter.dpToLength(px.toDp(), LengthUnit.Meters) }.toDouble()
+                detectSpatialDragGesture(
+                    context = context,
+                    targetedToEntity = TargetEntity.any(),
+                    onDragStart = { _, value ->
+                        val v = view ?: return@detectSpatialDragGesture
+                        drag[1] = SystemClock.uptimeMillis()
+                        val id = v.hitOf(value.targetEntity) ?: return@detectSpatialDragGesture
+                        Log.i(INPUT_TAG, "grab $id")
+                        if (id.startsWith("grip:")) main.post { if (Game.grab(id)) drag[0] = 1L }
+                    },
+                    onDragEnd = { main.post { letGo("end") } },
+                    onDragCancel = { main.post { letGo("cancel") } },
+                ) { value ->
+                    if (drag[0] != 1L) return@detectSpatialDragGesture
+                    drag[1] = SystemClock.uptimeMillis()
+                    // Room motion into the workshop's frame: turned by the table's heading, scaled by the shop
+                    // (Compose y points down).
+                    val (dx, dz) = place.toBook(meters(value.dragAmount.x), meters(value.dragAmount.z))
+                    val dy = -meters(value.dragAmount.y)
+                    val k = 1.0 / WorkshopView.SCALE
+                    main.post { Game.dragBy(Vec3(dx * k, dy * k, dz * k)) }
                 }
-                false
             }
-        },
+            .pointerInput(1) {
+                detectSpatialPointerEvent(context, TargetEntity.any()) { infos ->
+                    val v = view
+                    if (v != null) for (i in infos) {
+                        if (!i.isDownEvent()) continue
+                        val id = v.hitOf(i.targetedEntity) ?: continue
+                        Log.i(INPUT_TAG, "pinch $id")
+                        if (id.startsWith("band:")) main.post { Game.pinchWork(id) }
+                    }
+                    // The fingers opening ends a drag even when the drag's own end never comes.
+                    if (infos.any { it.isUpEvent() }) main.post { letGo("fingers up") }
+                    false
+                }
+            },
         attachments = {
             AttachmentPanel(PANEL_CARD) { CardPanel(converter) }
             AttachmentPanel(PANEL_ORDER) { OrderPanel(converter) }
@@ -204,13 +245,15 @@ fun WorkshopStage() {
                 val pose = runCatching { if (head.state == DataProvider.State.STARTED) head.latestData?.hmdPose else null }.getOrNull()
                 if (pose != null) place.frame(pose.position, pose.rotation.rotateVector(Vector3(0f, 0f, -1f)), dt, main)
                 main.post { Game.tick(dt) }
+                // A drag whose end never came: let go after two silent seconds.
+                if (drag[0] == 1L && SystemClock.uptimeMillis() - drag[1] > 2000) main.post { letGo("watchdog") }
                 v.frame(dt)
             }
         },
     )
 }
 
-private val MODELS = listOf("bamboo", "vat", "mortar", "mould", "wheel", "kiln", "dyevat", "inklamp", "inkmold", "inkstone", "guest")
+private val MODELS = listOf("bamboo", "vat", "mortar", "mould", "wheel", "kiln", "dyevat", "inklamp", "inkmold", "inkstone", "guest", "chopper", "mallet", "brush", "bellows")
 
 private fun attach(v: WorkshopView, a: SpatialViewAttachments, panels: HashMap<String, Entity>) {
     fun put(id: String, pos: Vector3, pitch: Float, yaw: Float = 0f) {
